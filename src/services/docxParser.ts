@@ -259,7 +259,49 @@ function parseParagraphsToQuestions(
         .replace(/\s*(?:trả\s*lời|đáp\s*án|đ\/?án|dap\s*an|tra\s*loi)\s*[:=\-]?\s*(?:đáp\s*án)?\s*$/i, '')
         .trim();
 
-      // Check if line contains multiple options: e.g. "A. 3   B. 2   C. 4   D. 5"
+      // Unpack embedded inline options (e.g. "A ... b. ... c. ... d. ...")
+      const inlineMatches = optText.split(/(?=\b[b-eB-E][\s.:)/\]]+)/i);
+      if (inlineMatches.length >= 2) {
+        optText = inlineMatches[0].trim();
+        const extraOpts: { letter: string; text: string }[] = [];
+        for (let k = 1; k < inlineMatches.length; k++) {
+          const sub = inlineMatches[k].trim();
+          const subM = sub.match(/^([b-eB-E])[\s.:)/\]]+\s*(.*)$/);
+          if (subM) {
+            extraOpts.push({
+              letter: subM[1].toUpperCase(),
+              text: subM[2].trim().replace(/\s*(?:trả\s*lời|đáp\s*án|đ\/?án|dap\s*an|tra\s*loi)\s*[:=\-]?\s*(?:đáp\s*án)?\s*$/i, '').trim(),
+            });
+          }
+        }
+
+        currentBlock!.options.push({
+          letter,
+          text: optText,
+          isBold: p.hasBoldRun,
+          isItalic: p.hasItalicRun,
+          isUnderline: p.hasUnderlineRun,
+          isRed: p.hasRedRun,
+          isYellow: p.hasYellowRun,
+          hasAsterisk: hasAst,
+        });
+
+        extraOpts.forEach((eo) => {
+          currentBlock!.options.push({
+            letter: eo.letter,
+            text: eo.text,
+            isBold: p.hasBoldRun,
+            isItalic: p.hasItalicRun,
+            isUnderline: p.hasUnderlineRun,
+            isRed: p.hasRedRun,
+            isYellow: p.hasYellowRun,
+            hasAsterisk: false,
+          });
+        });
+        continue;
+      }
+
+      // Check if line contains multiple tabbed options: e.g. "A. 3   B. 2   C. 4   D. 5"
       const multiRegex =
         /(?:^|\s{2,}|\t)(\*?)([A-Ea-e])(\*?)[\s.:)/\]]+\s*([^\t]+?)(?=(?:\s{2,}|\t)\*?[A-Ea-e]\*?[\s.:)/\]]+|$)/g;
       const multiMatches: {
@@ -366,11 +408,18 @@ function parseParagraphsToQuestions(
     let content = cleanContentLines.join(' ').trim();
     content = content.replace(/\s*(?:trả\s*lời|đáp\s*án|đ\/?án|dap\s*an|tra\s*loi)\s*[:=\-]?\s*(?:đáp\s*án)?\s*$/i, '').trim();
 
-    // Filter dummy options that are actually answer declarations (e.g., "Đáp án A", "Đ/ÁN: Đáp án A", "Đán án d", "Đáp án: a")
+    // Filter dummy options that are actually answer declarations or dummy placeholders (e.g., "Phương án B", "Phương án C (nếu có)...")
     const validOptions: typeof block.options = [];
     for (const opt of block.options) {
       const asciiOptText = opt.text.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
       const normOptText = opt.text.normalize('NFC').trim();
+
+      // Ignore dummy option placeholders like "Phương án B", "Phương án C (nếu có)..." if we already have valid options
+      if (/^phương\s*án\s+[b-e]\b/i.test(normOptText) || /^phuong\s*an\s+[b-e]\b/i.test(asciiOptText)) {
+        if (validOptions.some((existing) => existing.letter === opt.letter)) {
+          continue;
+        }
+      }
 
       const optAnsMatch =
         asciiOptText.match(/^(?:dap\s*an|dan\s*an|d\s*\/\s*an|d\s*\/|key|answer|tra\s*loi)(?:\s*dung)?(?:\s*la)?\s*[:=\-]?\s*([a-f])\b/i) ||
@@ -620,12 +669,24 @@ export async function parseDocxFile(
     }
 
     if (!res.ok || !data.success) {
-      if (!data.error && resText.includes('<!DOCTYPE')) {
-        throw new Error(
-          'Máy chủ Server cần được khởi động lại để kích hoạt bộ đọc file .doc. Hãy nhấn Ctrl+C ở màn hình chạy Server rồi gõ "npm run dev", HOẶC mở file trong Word rồi Save As thành .docx để nạp ngay!'
-        );
-      }
-      throw new Error(data.error || data.message || `Lỗi máy chủ khi đọc file .doc (HTTP ${res.status})`);
+      // Client-side fallback: extract text from binary arrayBuffer directly
+      try {
+        const decoder = new TextDecoder('utf-8', { fatal: false });
+        const rawText = decoder.decode(arrayBuffer);
+        const printableLines = rawText
+          .split(/[\r\n\x00-\x08\x0B\x0C\x0E-\x1F]+/)
+          .map((s) => s.replace(/[^\x20-\x7E\u00A0-\u024F\u1EA0-\u1EF9]/g, ' ').trim())
+          .filter((s) => s.length >= 2);
+
+        const textResult = printableLines.join('\n');
+        if (textResult.length > 50) {
+          return parseQuestionsFromRawText(textResult, defaultCategory, defaultPoints);
+        }
+      } catch {}
+
+      throw new Error(
+        data.error || data.message || 'Không thể đọc file .doc. Vui lòng lưu file thành dạng .docx rồi thử lại.'
+      );
     }
 
     if (data.isDocxConverted && data.docxBase64) {
