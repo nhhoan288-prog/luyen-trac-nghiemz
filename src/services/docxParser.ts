@@ -259,25 +259,37 @@ function parseParagraphsToQuestions(
         .replace(/\s*(?:trả\s*lời|đáp\s*án|đ\/?án|dap\s*an|tra\s*loi)\s*[:=\-]?\s*(?:đáp\s*án)?\s*$/i, '')
         .trim();
 
-      // Unpack embedded inline options (e.g. "A ... b. ... c. ... d. ...")
-      const inlineMatches = optText.split(/(?=\b[b-eB-E][\s.:)/\]]+)/i);
-      if (inlineMatches.length >= 2) {
-        optText = inlineMatches[0].trim();
+      // Unpack embedded inline options safely without chopping Vietnamese words like "nước.", "quốc.", "học."
+      const inlineOptRegex = /(?:^|[\s\t;])([b-eB-E])[\s.:)/\]]+\s*(?=[A-Za-z0-9à-ỹÀ-Ỹ"“'‘])/g;
+      const inlineMatches: { start: number; letter: string; fullLen: number }[] = [];
+      let im;
+      while ((im = inlineOptRegex.exec(optText)) !== null) {
+        const matchIdx = im.index;
+        const charBefore = matchIdx > 0 ? optText[matchIdx] : '';
+        if (/[a-zA-Zà-ỹÀ-Ỹ]/.test(charBefore)) continue;
+        inlineMatches.push({ start: matchIdx, letter: im[1].toUpperCase(), fullLen: im[0].length });
+      }
+
+      if (inlineMatches.length >= 1) {
+        const firstStart = inlineMatches[0].start;
+        const firstOptText = optText.substring(0, firstStart).trim();
         const extraOpts: { letter: string; text: string }[] = [];
-        for (let k = 1; k < inlineMatches.length; k++) {
-          const sub = inlineMatches[k].trim();
-          const subM = sub.match(/^([b-eB-E])[\s.:)/\]]+\s*(.*)$/);
-          if (subM) {
-            extraOpts.push({
-              letter: subM[1].toUpperCase(),
-              text: subM[2].trim().replace(/\s*(?:trả\s*lời|đáp\s*án|đ\/?án|dap\s*an|tra\s*loi)\s*[:=\-]?\s*(?:đáp\s*án)?\s*$/i, '').trim(),
-            });
+
+        for (let k = 0; k < inlineMatches.length; k++) {
+          const curr = inlineMatches[k];
+          const next = inlineMatches[k + 1];
+          const tStart = curr.start + curr.fullLen;
+          const tEnd = next ? next.start : optText.length;
+          let subText = optText.substring(tStart, tEnd).trim();
+          subText = subText.replace(/\s*(?:trả\s*lời|đáp\s*án|đ\/?án|dap\s*an|tra\s*loi)\s*[:=\-]?\s*(?:đáp\s*án)?\s*$/i, '').trim();
+          if (subText) {
+            extraOpts.push({ letter: curr.letter, text: subText });
           }
         }
 
         currentBlock!.options.push({
           letter,
-          text: optText,
+          text: firstOptText || optText,
           isBold: p.hasBoldRun,
           isItalic: p.hasItalicRun,
           isUnderline: p.hasUnderlineRun,
