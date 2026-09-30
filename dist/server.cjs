@@ -38,6 +38,7 @@ var import_word_extractor = __toESM(require("word-extractor"), 1);
 // server/database.ts
 var import_fs = __toESM(require("fs"), 1);
 var import_path = __toESM(require("path"), 1);
+var import_pg = __toESM(require("pg"), 1);
 
 // server/demoData.ts
 var DEMO_TEAMS = [
@@ -844,9 +845,69 @@ function seededShuffle(array, randomFn) {
 var QuizDatabase = class {
   constructor() {
     this.saveTimeout = null;
+    this.pool = null;
     this.dataDir = import_path.default.join(process.cwd(), "data");
     this.dbFilePath = import_path.default.join(this.dataDir, "quiz_database.json");
     this.db = this.initDatabase();
+    const dbUrl = process.env.DATABASE_URL;
+    if (dbUrl) {
+      try {
+        console.log("[QuizDatabase] Detected DATABASE_URL. Initializing PostgreSQL cloud storage...");
+        this.pool = new import_pg.default.Pool({
+          connectionString: dbUrl,
+          ssl: dbUrl.includes("localhost") ? false : { rejectUnauthorized: false },
+          max: 10,
+          idleTimeoutMillis: 3e4,
+          connectionTimeoutMillis: 1e4
+        });
+        this.initPgDatabase();
+      } catch (err) {
+        console.error("[QuizDatabase] Failed to create PostgreSQL pool:", err);
+        this.pool = null;
+      }
+    } else {
+      console.log("[QuizDatabase] Using local file storage: " + this.dbFilePath);
+    }
+  }
+  async initPgDatabase() {
+    if (!this.pool) return;
+    try {
+      await this.pool.query(`
+        CREATE TABLE IF NOT EXISTS system_store (
+          key VARCHAR(100) PRIMARY KEY,
+          data JSONB NOT NULL,
+          updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+      `);
+      console.log("[PostgreSQL] Table system_store checked/created successfully.");
+      const res = await this.pool.query(`SELECT data FROM system_store WHERE key = 'quiz_database' LIMIT 1;`);
+      if (res.rows.length > 0 && res.rows[0].data) {
+        const pgData = res.rows[0].data;
+        if (pgData && Array.isArray(pgData.questions) && pgData.questions.length > 0) {
+          console.log(`[PostgreSQL] Successfully loaded ${pgData.questions.length} questions from PostgreSQL cloud storage!`);
+          this.db = pgData;
+          this.saveLocalSync(this.db);
+          return;
+        }
+      }
+      console.log("[PostgreSQL] Seeding PostgreSQL with initial database...");
+      await this.saveToPg(this.db);
+    } catch (err) {
+      console.error("[PostgreSQL] Failed to initialize table or load data:", err);
+    }
+  }
+  async saveToPg(data = this.db) {
+    if (!this.pool) return;
+    try {
+      await this.pool.query(
+        `INSERT INTO system_store (key, data, updated_at)
+         VALUES ('quiz_database', $1, NOW())
+         ON CONFLICT (key) DO UPDATE SET data = $1, updated_at = NOW();`,
+        [JSON.stringify(data)]
+      );
+    } catch (err) {
+      console.error("[PostgreSQL] Error saving to PostgreSQL:", err);
+    }
   }
   initDatabase() {
     if (!import_fs.default.existsSync(this.dataDir)) {
@@ -858,16 +919,13 @@ var QuizDatabase = class {
         const parsed = JSON.parse(raw);
         if (parsed && Array.isArray(parsed.teams) && Array.isArray(parsed.questions)) {
           if (parsed.competition) {
-            parsed.competition.name = "H\u1ED8I THI OLYMPIC CNTT N\u0102M 2026";
-            parsed.competition.total_questions = 50;
-            parsed.competition.duration_minutes = 30;
-            parsed.competition.points_per_question = 0.6;
+            parsed.competition.name = parsed.competition.name || "H\u1ED8I THI OLYMPIC CNTT N\u0102M 2026";
+            parsed.competition.total_questions = parsed.questions.length;
+            parsed.competition.duration_minutes = parsed.competition.duration_minutes || 30;
+            parsed.competition.points_per_question = parsed.competition.points_per_question || 0.6;
           }
           if (!Array.isArray(parsed.quiz_sessions)) {
             parsed.quiz_sessions = [];
-          }
-          if (parsed.questions.length < 50) {
-            parsed.questions = [...DEMO_QUESTIONS];
           }
           return parsed;
         }
@@ -924,17 +982,58 @@ var QuizDatabase = class {
       this.saveSync(this.db);
     }, 50);
   }
-  saveSync(dataToSave = this.db) {
+  saveLocalSync(dataToSave = this.db) {
     try {
       if (!import_fs.default.existsSync(this.dataDir)) {
         import_fs.default.mkdirSync(this.dataDir, { recursive: true });
       }
       const tmpPath = this.dbFilePath + ".tmp";
-      import_fs.default.writeFileSync(tmpPath, JSON.stringify(dataToSave, null, 2), "utf-8");
-      import_fs.default.renameSync(tmpPath, this.dbFilePath);
+      try {
+        import_fs.default.writeFileSync(tmpPath, JSON.stringify(dataToSave, null, 2), "utf-8");
+        import_fs.default.renameSync(tmpPath, this.dbFilePath);
+      } catch (renameErr) {
+        import_fs.default.writeFileSync(this.dbFilePath, JSON.stringify(dataToSave, null, 2), "utf-8");
+        if (import_fs.default.existsSync(tmpPath)) {
+          try {
+            import_fs.default.unlinkSync(tmpPath);
+          } catch {
+          }
+        }
+      }
     } catch (err) {
       console.error("Error saving database to file:", err);
     }
+  }
+  saveSync(dataToSave = this.db) {
+    this.saveLocalSync(dataToSave);
+    if (this.pool) {
+      this.saveToPg(dataToSave).catch((err) => console.error("[PostgreSQL] Save error:", err));
+    }
+  }
+  getRawDatabase() {
+    return this.db;
+  }
+  replaceDatabase(newDbData) {
+    if (newDbData.questions && Array.isArray(newDbData.questions)) {
+      this.db.questions = newDbData.questions;
+      this.db.competition.total_questions = newDbData.questions.length;
+      this.db.settings.total_questions = newDbData.questions.length;
+    }
+    if (newDbData.teams && Array.isArray(newDbData.teams)) {
+      this.db.teams = newDbData.teams;
+    }
+    if (newDbData.competition) {
+      this.db.competition = { ...this.db.competition, ...newDbData.competition };
+    }
+    this.saveSync();
+  }
+  getCategories() {
+    const map = /* @__PURE__ */ new Map();
+    this.db.questions.forEach((q) => {
+      const cat = (q.category || "T\u1ED5ng h\u1EE3p").trim();
+      map.set(cat, (map.get(cat) || 0) + 1);
+    });
+    return Array.from(map.entries()).map(([name, count]) => ({ name, count }));
   }
   // --- Competition Methods ---
   getCompetition() {
@@ -1135,7 +1234,7 @@ var QuizDatabase = class {
       "SYSTEM_BOOT",
       `Admin \u0111\xE3 n\u1EA1p ${importedQuestions.length} c\xE2u h\u1ECFi m\u1EDBi (Ch\u1EBF \u0111\u1ED9: ${mode === "REPLACE" ? "Ghi \u0111\xE8" : "N\u1ED1i ti\u1EBFp"}). T\u1ED5ng s\u1ED1 c\xE2u hi\u1EC7n t\u1EA1i: ${totalCount}.`
     );
-    this.save();
+    this.saveSync();
     return { questions: this.db.questions, total: totalCount };
   }
   deleteQuestion(id) {
@@ -1146,10 +1245,49 @@ var QuizDatabase = class {
       this.db.questions.forEach((q, idx) => {
         q.question_number = idx + 1;
       });
-      this.save();
+      this.saveSync();
       return true;
     }
     return false;
+  }
+  renameCategory(oldCategory, newCategory) {
+    const trimmedOld = (oldCategory || "").trim();
+    const trimmedNew = (newCategory || "").trim();
+    if (!trimmedOld || !trimmedNew) {
+      throw new Error("T\xEAn b\u1ED9 \u0111\u1EC1 c\u0169 v\xE0 m\u1EDBi kh\xF4ng \u0111\u01B0\u1EE3c \u0111\u1EC3 tr\u1ED1ng.");
+    }
+    let count = 0;
+    this.db.questions.forEach((q) => {
+      if ((q.category || "").trim().toLowerCase() === trimmedOld.toLowerCase()) {
+        q.category = trimmedNew;
+        count++;
+      }
+    });
+    if (count > 0) {
+      this.saveSync();
+    }
+    return { updatedCount: count };
+  }
+  deleteCategory(categoryName) {
+    const trimmed = (categoryName || "").trim();
+    if (!trimmed) {
+      throw new Error("T\xEAn b\u1ED9 \u0111\u1EC1 c\u1EA7n x\xF3a kh\xF4ng \u0111\u01B0\u1EE3c \u0111\u1EC3 tr\u1ED1ng.");
+    }
+    const initialLen = this.db.questions.length;
+    this.db.questions = this.db.questions.filter(
+      (q) => (q.category || "").trim().toLowerCase() !== trimmed.toLowerCase()
+    );
+    const deletedCount = initialLen - this.db.questions.length;
+    if (deletedCount > 0) {
+      this.db.questions.sort((a, b) => a.question_number - b.question_number);
+      this.db.questions.forEach((q, idx) => {
+        q.question_number = idx + 1;
+      });
+      this.db.competition.total_questions = this.db.questions.length;
+      this.db.settings.total_questions = this.db.questions.length;
+      this.saveSync();
+    }
+    return { deletedCount, remainingCount: this.db.questions.length };
   }
   // =========================================================================
   // --- INDIVIDUAL EXAM SESSIONS (30 PHÚT, 50 CÂU XÁO TRỘN ĐỘC LẬP) ---
@@ -3433,6 +3571,80 @@ router.post("/reset-demo", requireAdminAuth, (req, res) => {
   });
   res.json({ success: true, message: "\u0110\xE3 \u0111\u1EB7t l\u1EA1i to\xE0n b\u1ED9 h\u1EC7 th\u1ED1ng v\u1EC1 50 c\xE2u h\u1ECFi demo ban \u0111\u1EA7u." });
 });
+router.post("/question-sets/rename", (req, res) => {
+  try {
+    const { oldName, newName } = req.body;
+    if (!oldName || !newName) {
+      return res.status(400).json({ error: "T\xEAn b\u1ED9 \u0111\u1EC1 c\u0169 v\xE0 m\u1EDBi kh\xF4ng \u0111\u01B0\u1EE3c \u0111\u1EC3 tr\u1ED1ng." });
+    }
+    const result = db.renameCategory(oldName, newName);
+    return res.json({
+      success: true,
+      message: `\u0110\xE3 \u0111\u1ED5i t\xEAn b\u1ED9 \u0111\u1EC1 t\u1EEB "${oldName}" th\xE0nh "${newName}" (${result.updatedCount} c\xE2u h\u1ECFi).`,
+      ...result
+    });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+router.post("/question-sets/delete", (req, res) => {
+  try {
+    const { category } = req.body;
+    if (!category) {
+      return res.status(400).json({ error: "T\xEAn b\u1ED9 \u0111\u1EC1 c\u1EA7n x\xF3a l\xE0 b\u1EAFt bu\u1ED9c." });
+    }
+    const result = db.deleteCategory(category);
+    return res.json({
+      success: true,
+      message: `\u0110\xE3 x\xF3a th\xE0nh c\xF4ng b\u1ED9 \u0111\u1EC1 "${category}" (${result.deletedCount} c\xE2u h\u1ECFi \u0111\xE3 b\u1ECB x\xF3a).`,
+      ...result
+    });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+router.get("/database/export-json", (req, res) => {
+  try {
+    const raw = db.getRawDatabase();
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="quiz_database.json"');
+    return res.send(JSON.stringify(raw, null, 2));
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+router.post("/database/import-json", (req, res) => {
+  try {
+    const data = req.body;
+    if (!data || !Array.isArray(data.questions)) {
+      return res.status(400).json({ error: "D\u1EEF li\u1EC7u JSON kh\xF4ng h\u1EE3p l\u1EC7 (c\u1EA7n c\xF3 m\u1EA3ng questions)." });
+    }
+    db.replaceDatabase(data);
+    quizWsServer.broadcast({
+      type: "SYSTEM_RESET",
+      data: { message: "C\u01A1 s\u1EDF d\u1EEF li\u1EC7u c\xE2u h\u1ECFi \u0111\xE3 \u0111\u01B0\u1EE3c c\u1EADp nh\u1EADt t\u1EEB file sao l\u01B0u." }
+    });
+    return res.json({
+      success: true,
+      message: `\u0110\xE3 n\u1EA1p th\xE0nh c\xF4ng to\xE0n b\u1ED9 ${data.questions.length} c\xE2u h\u1ECFi v\xE0o h\u1EC7 th\u1ED1ng.`,
+      totalQuestions: data.questions.length
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+router.get("/database/status", (req, res) => {
+  const isPg = Boolean(process.env.DATABASE_URL);
+  const questionsCount = db.getQuestions().length;
+  const categories = db.getCategories();
+  return res.json({
+    storageType: isPg ? "PostgreSQL (Cloud Persistent - \u0110\xE3 k\u1EBFt n\u1ED1i \u0111\xE1m m\xE2y)" : "Local File (data/quiz_database.json)",
+    isPersistentOnRender: isPg,
+    totalQuestions: questionsCount,
+    totalCategories: categories.length,
+    categories
+  });
+});
 var api_default = router;
 
 // server.ts
@@ -3452,7 +3664,8 @@ async function startServer() {
   });
   const server = import_http.default.createServer(app);
   quizWsServer.init(server);
-  if (process.env.NODE_ENV !== "production") {
+  const isProduction = process.env.NODE_ENV === "production" || process.argv[1] && process.argv[1].includes("dist");
+  if (!isProduction) {
     const vite = await (0, import_vite.createServer)({
       server: {
         middlewareMode: true,
